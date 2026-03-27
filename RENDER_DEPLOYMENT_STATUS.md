@@ -6,7 +6,7 @@
 The volunteer frontend is already properly configured to fetch data from Render:
 
 **Frontend Configuration:**
-- Environment variable: `VITE_API_URL=https://healthtrace-j1uc.onrender.com`
+- Environment variable: `VITE_API_URL=http://localhost:8000` (for local development)
 - API client in `api.js` configured to use Render URL
 - CORS enabled on backend: `CORS_ALLOW_ALL_ORIGINS=True`
 - SubmissionGuard component uses `screeningAPI.create()` to submit screenings
@@ -28,6 +28,7 @@ The `healthtrace_be/requirements.txt` file was corrupted with encoding issues, c
 **Fix Applied:**
 - Fixed `healthtrace_be/requirements.txt` with proper dependencies
 - Added `psycopg2-binary` for PostgreSQL support
+- Updated CORS settings to allow `http://localhost:5173`
 
 ## What Needs to Happen
 
