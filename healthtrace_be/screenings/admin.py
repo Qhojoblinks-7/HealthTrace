@@ -1,38 +1,27 @@
 from django.contrib import admin
-from .models import Screening, Doctor
+from .models import RoleConfig, ScreeningStation, PatientWorkflow, StationEntry
 
+@admin.register(RoleConfig)
+class RoleConfigAdmin(admin.ModelAdmin):
+    list_display = ('role_name', 'is_active', 'created_at')
+    list_filter = ('is_active',)
+    search_fields = ('role_name',)
 
-@admin.register(Doctor)
-class DoctorAdmin(admin.ModelAdmin):
-    list_display = ['user', 'phone_number', 'specialization', 'created_at']
-    search_fields = ['user__username', 'user__first_name', 'user__last_name']
-    list_filter = ['specialization', 'created_at']
+@admin.register(ScreeningStation)
+class ScreeningStationAdmin(admin.ModelAdmin):
+    list_display = ('step_order', 'name', 'role_config', 'is_final_discharge', 'is_active')
+    list_filter = ('is_final_discharge', 'is_active')
+    ordering = ('step_order',)
 
+@admin.register(PatientWorkflow)
+class PatientWorkflowAdmin(admin.ModelAdmin):
+    list_display = ('token_id', 'patient_name', 'current_station', 'is_urgent', 'is_completed', 'created_at')
+    list_filter = ('current_station', 'is_urgent', 'is_completed')
+    search_fields = ('token_id', 'patient_name', 'phone_number')
+    readonly_fields = ('created_at', 'updated_at')
 
-@admin.register(Screening)
-class ScreeningAdmin(admin.ModelAdmin):
-    list_display = ['full_name', 'age', 'gender', 'bmi', 'blood_pressure_status', 'glucose_status', 'has_consultation', 'created_at']
-    search_fields = ['full_name', 'phone_number']
-    list_filter = ['gender', 'created_at', 'doctor']
-    readonly_fields = ['bmi', 'bmi_category', 'blood_pressure_status', 'glucose_status', 'is_critical', 'created_at', 'updated_at']
-    
-    fieldsets = (
-        ('Personal Information', {
-            'fields': ('full_name', 'age', 'gender', 'phone_number', 'email')
-        }),
-        ('Physical Measurements', {
-            'fields': ('weight_kg', 'height_cm', 'bmi', 'bmi_category')
-        }),
-        ('Vital Signs', {
-            'fields': ('systolic_bp', 'diastolic_bp', 'blood_pressure_status', 'glucose_level', 'glucose_status', 'heart_rate')
-        }),
-        ('Medical History', {
-            'fields': ('known_conditions', 'current_medications', 'notes')
-        }),
-        ('Screening Info', {
-            'fields': ('screened_by', 'created_at')
-        }),
-        ('Doctor Consultation', {
-            'fields': ('doctor', 'doctor_advice', 'consultation_date')
-        }),
-    )
+@admin.register(StationEntry)
+class StationEntryAdmin(admin.ModelAdmin):
+    list_display = ('patient', 'station', 'recorded_by', 'created_at')
+    list_filter = ('station',)
+    search_fields = ('patient__token_id', 'patient__patient_name')

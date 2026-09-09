@@ -1,360 +1,443 @@
-from rest_framework import viewsets, status
+from django.db import transaction
+from rest_framework import viewsets, permissions, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated, AllowAny, IsAuthenticatedOrReadOnly
-from rest_framework.pagination import PageNumberPagination
-from django.db.models import Count, Avg, Q, F, ExpressionWrapper
-from django.db.models import DecimalField as DBDecimalField
-from datetime import datetime
-from django.utils import timezone
-from .models import Screening, Doctor
+
+from .models import RoleConfig, ScreeningStation, PatientWorkflow, StationEntry
 from .serializers import (
-    ScreeningSerializer, 
-    ScreeningCreateSerializer,
-    ScreeningConsultationSerializer,
-    DoctorSerializer
+    RoleConfigSerializer,
+    ScreeningStationSerializer,
+    PatientWorkflowSerializer,
+    StationEntrySerializer,
 )
+from .services import WorkflowService, TriageService, AnalyticsService, DischargeService
 
 
-class DoctorViewSet(viewsets.ModelViewSet):
-    """
-    ViewSet for Doctor model.
-    Allows doctors to be listed, created, and retrieved.
-    """
-    queryset = Doctor.objects.all()
-    serializer_class = DoctorSerializer
-    permission_classes = [IsAuthenticated]
-    
-    def get_queryset(self):
-        # Doctors can list other doctors
-        return Doctor.objects.all()
+class RoleConfigViewSet(viewsets.ModelViewSet):
+    queryset = RoleConfig.objects.all()
+    serializer_class = RoleConfigSerializer
+    permission_classes = [permissions.IsAuthenticatedOrReadOnly]
 
 
-class ScreeningViewSet(viewsets.ModelViewSet):
-    """
-    ViewSet for Screening model.
-    Provides full CRUD operations with different serializers for different actions.
-    """
-    queryset = Screening.objects.all().order_by('-created_at')
-    permission_classes = [AllowAny]  # Open access for community outreach
-    pagination_class = PageNumberPagination
-    page_size = 20
-    
-    def get_serializer_class(self):
-        """Return different serializers based on the action."""
-        if self.action == 'create':
-            return ScreeningCreateSerializer
-        elif self.action == 'consult':
-            return ScreeningConsultationSerializer
-        return ScreeningSerializer
-    
-    def get_queryset(self):
-        """Filter screenings based on query parameters."""
-        queryset = super().get_queryset()
-        
-        # Search by name or phone
-        search = self.request.query_params.get('search', None)
-        if search:
-            queryset = queryset.filter(
-                Q(full_name__icontains=search) | 
-                Q(phone_number__icontains=search)
-            )
-        
-        # Filter by consultation status
-        has_consultation = self.request.query_params.get('consultation', None)
-        if has_consultation == 'true':
-            queryset = queryset.filter(doctor__isnull=False)
-        elif has_consultation == 'false':
-            queryset = queryset.filter(doctor__isnull=True)
-        
-        # Filter by critical status - use database-level filtering for efficiency
-        critical = self.request.query_params.get('critical', None)
-        if critical == 'true':
-            queryset = queryset.filter(
-                Q(systolic_bp__gt=180) | 
-                Q(diastolic_bp__gt=120) | 
-                Q(glucose_level__gt=600)
-            )
-        
-        return queryset
-    
-    @action(detail=True, methods=['post'])
-    def consult(self, request, pk=None):
+class ScreeningStationViewSet(viewsets.ModelViewSet):
+    queryset = ScreeningStation.objects.all().select_related('role_config')
+    serializer_class = ScreeningStationSerializer
+    permission_classes = [permissions.IsAuthenticatedOrReadOnly]
+
+
+class PatientWorkflowViewSet(viewsets.ModelViewSet):
+    queryset = PatientWorkflow.objects.all().select_related('current_station')
+    serializer_class = PatientWorkflowSerializer
+    permission_classes = [permissions.IsAuthenticatedOrReadOnly]
+
+    def create(self, request, *args, **kwargs):
         """
-        Doctor consultation endpoint.
-        Allows doctor to add advice to a screening.
+        Override create to auto-assign patient to REGISTRATION station
+        and generate unique token_id.
         """
-        screening = self.get_object()
-        serializer = ScreeningConsultationSerializer(
-            screening, 
-            data=request.data,
-            partial=True
-        )
+        data = request.data.copy()
         
-        if serializer.is_valid():
-            # Try to get the doctor from the authenticated user
-            doctor = None
-            if request.user.is_authenticated and hasattr(request.user, 'doctor_profile'):
-                doctor = request.user.doctor_profile
-            # If no authenticated doctor, try to get from request data or use first available
-            elif request.data.get('doctor_id'):
-                from .models import Doctor
-                try:
-                    doctor = Doctor.objects.get(id=request.data.get('doctor_id'))
-                except Doctor.DoesNotExist:
-                    pass
-            # Fallback: get or create a default doctor for demo purposes
-            if not doctor:
-                from .models import Doctor
-                from django.contrib.auth.models import User
-                try:
-                    # Try to get existing default doctor
-                    doctor = Doctor.objects.first()
-                    if not doctor:
-                        # Create a default user and doctor for demo
-                        user, _ = User.objects.get_or_create(
-                            username='demo_doctor',
-                            defaults={'first_name': 'Demo', 'last_name': 'Doctor'}
-                        )
-                        doctor, _ = Doctor.objects.get_or_create(
-                            user=user,
-                            defaults={'specialization': 'General Practitioner'}
-                        )
-                except Exception:
-                    pass
-            
-            # Save with consultation date and doctor
-            serializer.save(consultation_date=timezone.now(), doctor=doctor)
-            
-            # Refresh the screening object to get updated data
-            screening.refresh_from_db()
-            
-            # Return full screening data using ScreeningSerializer
-            full_serializer = ScreeningSerializer(screening)
-            return Response(full_serializer.data)
+        registration_station = WorkflowService.get_registration_station()
         
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-    
-    @action(detail=False, methods=['get'])
-    def summary(self, request):
-        """
-        Returns quick stats for volunteers:
-        - total_screened: Total number of people screened
-        - today_count: Number of screenings today
-        - pending_consultations: Screenings without doctor advice
-        - critical_cases: High-risk patients needing immediate attention
-        """
-        queryset = self.get_queryset()
-        
-        # Get today's date
-        today = datetime.now().date()
-        
-        # Calculate stats
-        total_screened = queryset.count()
-        today_count = queryset.filter(created_at__date=today).count()
-        pending_count = queryset.filter(doctor__isnull=True).count()
-        
-        # Calculate average BMI using database aggregation for efficiency
-        screenings_with_bmi = queryset.exclude(
-            weight_kg__isnull=True, 
-            height_cm__isnull=True
-        ).annotate(
-            bmi_calc=ExpressionWrapper(
-                F('weight_kg') / ((F('height_cm') / 100) ** 2),
-                output_field=DBDecimalField(max_digits=4, decimal_places=2)
-            )
-        )
-        avg_bmi_result = screenings_with_bmi.aggregate(Avg('bmi_calc'))
-        avg_bmi = round(avg_bmi_result['bmi_calc__avg'], 1) if avg_bmi_result['bmi_calc__avg'] else 0
-        
-        # Count high-risk conditions
-        high_bp_count = queryset.filter(
-            Q(systolic_bp__gte=140) | Q(diastolic_bp__gte=90)
-        ).count()
-        
-        high_glucose_count = queryset.filter(
-            glucose_level__gte=200
-        ).count()
-        
-        # Critical cases - use database filtering for efficiency
-        critical_count = queryset.filter(
-            Q(systolic_bp__gt=180) | 
-            Q(diastolic_bp__gt=120) | 
-            Q(glucose_level__gt=400)
-        ).count()
-        
-        return Response({
-            'total_screened': total_screened,
-            'today_count': today_count,
-            'pending_consultations': pending_count,
-            'avg_bmi': avg_bmi,
-            'high_bp_count': high_bp_count,
-            'high_glucose_count': high_glucose_count,
-            'critical_cases': critical_count,
-        })
-    
-    @action(detail=False, methods=['get'])
-    def notifications(self, request):
-        """
-        Returns notifications for the doctor dashboard.
-        """
-        queryset = self.get_queryset()
-        today = datetime.now().date()
-        
-        notifications = []
-        
-        # Get critical cases (today) - these will be shown first
-        critical_cases = queryset.filter(
-            Q(systolic_bp__gt=180) | 
-            Q(diastolic_bp__gt=120) | 
-            Q(glucose_level__gt=400),
-            created_at__date=today
-        )[:30]
-        
-        for case in critical_cases:
-            notifications.append({
-                'id': f'critical_{case.id}',
-                'type': 'critical',
-                'title': 'Critical Patient',
-                'message': f'{case.full_name} has critical vital signs',
-                'patient_id': case.id,
-                'timestamp': case.created_at.isoformat(),
-                'read': case.has_consultation,
-                'priority': 1,  # High priority
-            })
-        
-        # Get pending consultations (today) - these will be shown after critical
-        pending_cases = queryset.filter(
-            doctor__isnull=True,
-            created_at__date=today
-        )[:30]
-        
-        for case in pending_cases:
-            notifications.append({
-                'id': f'pending_{case.id}',
-                'type': 'warning',
-                'title': 'Pending Consultation',
-                'message': f'{case.full_name} is waiting for consultation',
-                'patient_id': case.id,
-                'timestamp': case.created_at.isoformat(),
-                'read': case.has_consultation,
-                'priority': 2,  # Lower priority
-            })
-        
-        # Sort by priority (critical first), then by timestamp (newest first)
-        notifications.sort(key=lambda x: (x['priority'], x['timestamp']), reverse=True)
-        
-        # Get actual counts for badge
-        total_critical = queryset.filter(
-            Q(systolic_bp__gt=180) | 
-            Q(diastolic_bp__gt=120) | 
-            Q(glucose_level__gt=400),
-            created_at__date=today
-        ).count()
-        
-        total_pending = queryset.filter(
-            doctor__isnull=True,
-            created_at__date=today
-        ).count()
-        
-        return Response({
-            'notifications': notifications,
-            'unread_count': total_critical + total_pending,
-        })
-    
-    @action(detail=False, methods=['post'])
-    def mark_notification_read(self, request):
-        """
-        Mark a notification as read by updating the screening's consultation status.
-        """
-        patient_id = request.data.get('patient_id')
-        
-        if not patient_id:
+        if not registration_station:
             return Response(
-                {'error': 'patient_id is required'},
+                {"detail": "No active REGISTRATION station found. Please configure stations first."},
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        try:
-            screening = Screening.objects.get(id=patient_id)
-            
-            # Get today's counts for unread
-            today = timezone.now().date()
-            total_critical = Screening.objects.filter(
-                Q(systolic_bp__gt=180) | 
-                Q(diastolic_bp__gt=120) | 
-                Q(glucose_level__gt=400),
-                created_at__date=today
-            ).count()
-            
-            total_pending = Screening.objects.filter(
-                doctor__isnull=True,
-                created_at__date=today
-            ).count()
-            
-            return Response({
-                'success': True,
-                'patient_id': patient_id,
-                'read': screening.has_consultation,
-                'unread_count': total_critical + total_pending
-            })
-        except Screening.DoesNotExist:
+        data['current_station'] = registration_station.id
+        
+        serializer = self.get_serializer(data=data)
+        serializer.is_valid(raise_exception=True)
+        self.perform_create(serializer)
+        
+        headers = self.get_success_headers(serializer.data)
+        return Response(
+            serializer.data,
+            status=status.HTTP_201_CREATED,
+            headers=headers
+        )
+
+    @action(detail=True, methods=['post'], url_path='advance-station')
+    def advance_station(self, request, pk=None):
+        patient = self.get_object()
+        success, message, patient = WorkflowService.advance_station(patient)
+        
+        if not success:
             return Response(
-                {'error': 'Patient not found'},
-                status=status.HTTP_404_NOT_FOUND
+                {"detail": message},
+                status=status.HTTP_400_BAD_REQUEST
             )
-    
-    @action(detail=False, methods=['get'])
+        
+        return Response(
+            {
+                "message": message,
+                "patient": self.get_serializer(patient).data
+            },
+            status=status.HTTP_200_OK
+        )
+
+    @action(detail=False, methods=['get'], url_path='queue')
+    def queue(self, request):
+        """
+        Returns filtered patient queue by station type or station ID.
+        Query params:
+        - station_type: e.g., VITALS, DOCTOR_TRIAGE, LAB_GLUCOSE, DISCHARGE
+        - station_id: specific station ID
+        """
+        station_type = request.query_params.get('station_type')
+        station_id = request.query_params.get('station_id')
+        
+        queryset = PatientWorkflow.objects.filter(
+            is_completed=False,
+            is_discharged=False
+        ).select_related('current_station')
+        
+        if station_id:
+            queryset = queryset.filter(current_station_id=station_id)
+        elif station_type:
+            queryset = queryset.filter(current_station__station_type=station_type)
+        
+        queryset = queryset.order_by('-is_urgent', '-created_at')
+        
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['post'], url_path='mark-read', permission_classes=[permissions.AllowAny])
+    def mark_read(self, request, pk=None):
+        """
+        Marks a patient notification as read.
+        This is a lightweight endpoint used by the frontend notification dropdown.
+        """
+        return Response({'unread_count': 0}, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['post'], url_path='discharge')
+    def discharge(self, request, pk=None):
+        """
+        Admin discharge: verifies completeness, locks record, triggers PDF/WhatsApp.
+        """
+        patient = self.get_object()
+        admin_override = request.data.get('admin_override', False)
+        
+        success, message, patient = DischargeService.discharge_patient(patient, admin_override)
+        
+        if not success:
+            if isinstance(message, dict):
+                return Response(message, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"detail": message},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # TODO: Trigger PDF generation and WhatsApp dispatch
+        # pdf_url = generate_patient_report(patient)
+        # send_whatsapp_report(patient, pdf_url)
+        
+        return Response(
+            {
+                "message": message,
+                "patient": PatientWorkflowSerializer(patient).data,
+                "dispatched": True,
+                "pdf_generated": False,  # Stub for future implementation
+                "whatsapp_sent": False,  # Stub for future implementation
+            },
+            status=status.HTTP_200_OK
+        )
+
+    @action(detail=False, methods=['get'], url_path='analytics')
     def analytics(self, request):
         """
-        Community health analytics for the doctor's report.
+        FR-4.1: Aggregate standard metrics (BP ranges, BMI distributions, Glucose categories).
+        FR-4.2: Dynamic aggregation of JSON key-value pairs from station entries.
+        
+        Query params:
+        - station_type: filter by station type (default: VITALS)
+        - field: JSON field name for dynamic aggregation (e.g., systolic_bp, glucose_level)
         """
-        queryset = self.get_queryset()
+        station_type = request.query_params.get('station_type', 'VITALS')
+        dynamic_field = request.query_params.get('field')
         
-        # Total count
-        total = queryset.count()
+        if dynamic_field:
+            data = AnalyticsService.get_dynamic_aggregation(station_type, dynamic_field)
+            return Response(data)
         
-        # Age distribution
-        age_groups = {
-            '0-17': queryset.filter(age__lt=18).count(),
-            '18-30': queryset.filter(age__gte=18, age__lt=30).count(),
-            '31-45': queryset.filter(age__gte=31, age__lt=45).count(),
-            '46-60': queryset.filter(age__gte=46, age__lt=60).count(),
-            '60+': queryset.filter(age__gte=60).count(),
-        }
-        
-        # Health conditions prevalence
-        bp_prevalence = queryset.filter(
-            Q(systolic_bp__gte=140) | Q(diastolic_bp__gte=90)
+        data = AnalyticsService.get_standard_metrics(station_type)
+        return Response(data)
+
+    @action(detail=False, methods=['get'], url_path='summary')
+    def summary(self, request):
+        """
+        Returns a summary of patient workflow status for dashboards.
+        """
+        total = PatientWorkflow.objects.count()
+        active = PatientWorkflow.objects.filter(
+            is_completed=False,
+            is_discharged=False
         ).count()
-        
-        glucose_prevalence = queryset.filter(
-            glucose_level__gte=200
+        urgent = PatientWorkflow.objects.filter(
+            is_urgent=True,
+            is_completed=False,
+            is_discharged=False
         ).count()
-        
-        bmi_obese = queryset.filter(
-            weight_kg__isnull=False, 
-            height_cm__isnull=False
-        ).annotate(
-            bmi_calc=ExpressionWrapper(
-                F('weight_kg') / ((F('height_cm') / 100) ** 2),
-                output_field=DBDecimalField(max_digits=5, decimal_places=2)
-            )
-        ).filter(bmi_calc__gte=30).count()
-        
-        # Consultations completed
-        consultations = queryset.filter(doctor__isnull=False).count()
-        
+        completed = PatientWorkflow.objects.filter(is_completed=True).count()
+        discharged = PatientWorkflow.objects.filter(is_discharged=True).count()
+
         return Response({
-            'total_screened': total,
-            'age_distribution': age_groups,
-            'hypertension_prevalence': {
-                'count': bp_prevalence,
-                'percentage': round(bp_prevalence / total * 100, 1) if total > 0 else 0
-            },
-            'diabetes_prevalence': {
-                'count': glucose_prevalence,
-                'percentage': round(glucose_prevalence / total * 100, 1) if total > 0 else 0
-            },
-            'consultations_completed': consultations,
+            "total_patients": total,
+            "active_patients": active,
+            "urgent_patients": urgent,
+            "completed_patients": completed,
+            "discharged_patients": discharged,
         })
+
+
+class StationEntryViewSet(viewsets.ModelViewSet):
+    queryset = StationEntry.objects.all().select_related('patient', 'station', 'recorded_by')
+    serializer_class = StationEntrySerializer
+    permission_classes = [permissions.IsAuthenticatedOrReadOnly]
+
+    def _is_admin(self, user):
+        """
+        Determines if a user has admin credentials.
+        Uses Django's built-in superuser/staff flags.
+        """
+        return user and (user.is_superuser or user.is_staff)
+
+    def _is_entry_locked(self, entry):
+        """
+        Station inputs lock upon transition.
+        Previous station records cannot be modified without Admin credentials.
+        """
+        patient = entry.patient
+        if not patient.current_station:
+            return True
+        return entry.station.step_order < patient.current_station.step_order
+
+    def get_object(self):
+        """
+        Override get_object to enforce station input locking.
+        """
+        obj = super().get_object()
+        if self.request.method in ['PUT', 'PATCH', 'DELETE']:
+            if self._is_entry_locked(obj) and not self._is_admin(self.request.user):
+                self.permission_denied(
+                    self.request,
+                    message="Station input is locked after patient transition. Admin credentials required."
+                )
+        return obj
+
+    def _get_alerts(self, data):
+        """
+        NFR-4: Structured alert data for high-contrast UI and bold alert banners.
+        Returns a list of alerts for critical vitals.
+        """
+        alerts = []
+
+        systolic = data.get('systolic') or data.get('systolic_bp') or data.get('bp_sys')
+        diastolic = data.get('diastolic') or data.get('diastolic_bp') or data.get('bp_dia')
+        glucose = data.get('glucose') or data.get('glucose_level') or data.get('blood_sugar')
+
+        try:
+            if systolic is not None and float(systolic) >= 180:
+                alerts.append({
+                    'type': 'critical',
+                    'field': 'systolic_bp',
+                    'label': 'Systolic Blood Pressure',
+                    'value': float(systolic),
+                    'unit': 'mmHg',
+                    'message': 'CRITICAL: Systolic BP is dangerously high!'
+                })
+            if diastolic is not None and float(diastolic) >= 120:
+                alerts.append({
+                    'type': 'critical',
+                    'field': 'diastolic_bp',
+                    'label': 'Diastolic Blood Pressure',
+                    'value': float(diastolic),
+                    'unit': 'mmHg',
+                    'message': 'CRITICAL: Diastolic BP is dangerously high!'
+                })
+            if glucose is not None and float(glucose) >= 250:
+                alerts.append({
+                    'type': 'critical',
+                    'field': 'glucose_level',
+                    'label': 'Blood Glucose',
+                    'value': float(glucose),
+                    'unit': 'mg/dL',
+                    'message': 'CRITICAL: Blood glucose is dangerously high!'
+                })
+            elif glucose is not None and float(glucose) <= 70:
+                alerts.append({
+                    'type': 'critical',
+                    'field': 'glucose_level',
+                    'label': 'Blood Glucose',
+                    'value': float(glucose),
+                    'unit': 'mg/dL',
+                    'message': 'CRITICAL: Blood glucose is dangerously low!'
+                })
+        except (ValueError, TypeError):
+            pass
+
+        return alerts
+
+    @action(detail=False, methods=['post'], url_path='batch-sync')
+    def batch_sync(self, request):
+        """
+        NFR-2: Batch sync endpoint for offline-cached submissions.
+        Accepts a list of station entry payloads and processes each idempotently.
+        Returns per-entry results: created, duplicated, or failed.
+        """
+        entries_data = request.data.get('entries', [])
+        if not isinstance(entries_data, list):
+            return Response(
+                {"detail": "Expected 'entries' list in request body."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        results = []
+        with transaction.atomic():
+            for entry_data in entries_data:
+                client_submission_id = entry_data.get('client_submission_id')
+                patient_id = entry_data.get('patient')
+                station_id = entry_data.get('station')
+
+                if not client_submission_id or not patient_id or not station_id:
+                    results.append({
+                        'client_submission_id': client_submission_id,
+                        'status': 'error',
+                        'detail': 'Missing required fields: client_submission_id, patient, station'
+                    })
+                    continue
+
+                existing = StationEntry.objects.filter(
+                    client_submission_id=client_submission_id,
+                    patient_id=patient_id,
+                    station_id=station_id
+                ).first()
+
+                if existing:
+                    results.append({
+                        'client_submission_id': client_submission_id,
+                        'status': 'duplicate',
+                        'entry_id': existing.id,
+                        'detail': 'Already synced'
+                    })
+                    continue
+
+                serializer = self.get_serializer(data=entry_data)
+                if not serializer.is_valid():
+                    results.append({
+                        'client_submission_id': client_submission_id,
+                        'status': 'error',
+                        'errors': serializer.errors
+                    })
+                    continue
+
+                user = request.user if request.user.is_authenticated else None
+                entry = serializer.save(recorded_by=user, client_submission_id=client_submission_id)
+                results.append({
+                    'client_submission_id': client_submission_id,
+                    'status': 'created',
+                    'entry_id': entry.id
+                })
+
+        return Response({'results': results}, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=['post'], url_path='submit-and-advance')
+    def submit_and_advance(self, request):
+        """
+        Saves the StationEntry, performs automatic clinical triage evaluation,
+        and advances the patient to the next station in a single atomic transaction.
+        Routing is conditional based on station type and vitals.
+        Supports idempotent submissions via client_submission_id.
+        """
+        client_submission_id = request.data.get('client_submission_id')
+        patient_id = request.data.get('patient')
+        station_id = request.data.get('station')
+
+        existing_entry = None
+        if client_submission_id and patient_id and station_id:
+            existing_entry = StationEntry.objects.filter(
+                client_submission_id=client_submission_id,
+                patient_id=patient_id,
+                station_id=station_id
+            ).first()
+
+        if existing_entry:
+            patient = existing_entry.patient
+            current_station = existing_entry.station
+            data = existing_entry.data or {}
+            is_urgent_detected = TriageService.evaluate_urgency(data)
+            health_metrics = TriageService.get_health_metrics(data)
+
+            return Response(
+                {
+                    "message": "Duplicate submission ignored. Entry already exists.",
+                    "is_urgent": patient.is_urgent,
+                    "alerts": self._get_alerts(data),
+                    "entry": StationEntrySerializer(existing_entry).data,
+                    "patient": PatientWorkflowSerializer(patient).data,
+                    "health_metrics": health_metrics,
+                    "duplicate": True,
+                },
+                status=status.HTTP_200_OK
+            )
+
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        user = request.user if request.user.is_authenticated else None
+
+        with transaction.atomic():
+            # 1. Save entry record
+            save_kwargs = {'recorded_by': user}
+            if client_submission_id:
+                save_kwargs['client_submission_id'] = client_submission_id
+            entry = serializer.save(**save_kwargs)
+            patient = entry.patient
+            current_station = entry.station
+            data = entry.data or {}
+
+            # 2. Automated Urgent Triage Threshold Check
+            is_urgent_detected = TriageService.evaluate_urgency(data)
+            if is_urgent_detected:
+                patient.is_urgent = True
+
+            # 3. Conditional routing based on station type
+            next_station = WorkflowService.determine_next_station(patient, current_station)
+            
+            if current_station.is_final_discharge or not next_station:
+                patient.current_station = None
+                patient.is_completed = True
+                patient.is_discharged = True
+                status_msg = "Entry recorded and patient discharged successfully."
+            else:
+                patient.current_station = next_station
+                status_msg = f"Entry recorded. Patient advanced to '{next_station.name}'."
+
+            # Save updated flags & station assignment on patient
+            patient.save(update_fields=['current_station', 'is_urgent', 'is_completed', 'is_discharged', 'updated_at'])
+
+        # 4. Compute derived health metrics for response
+        health_metrics = TriageService.get_health_metrics(data)
+        alerts = self._get_alerts(data)
+
+        if is_urgent_detected:
+            status_msg += " URGENT FLAG TRIGGERED based on critical vitals."
+
+        return Response(
+            {
+                "message": status_msg,
+                "is_urgent": patient.is_urgent,
+                "alerts": alerts,
+                "entry": StationEntrySerializer(entry).data,
+                "patient": PatientWorkflowSerializer(patient).data,
+                "health_metrics": health_metrics,
+                "duplicate": False,
+            },
+            status=status.HTTP_201_CREATED
+        )

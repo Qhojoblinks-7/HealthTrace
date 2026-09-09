@@ -1,100 +1,121 @@
-# CORS Fix Summary
+# CORS and 404 Error Fix Summary
 
-## Problem
-The frontend at `https://healthtrace-fe.vercel.app` was getting CORS errors when trying to access the backend API at `https://healthtrace-j1uc.onrender.com`. The error messages showed:
-- "No 'Access-Control-Allow-Origin' header is present on the requested resource"
-- 404 (Not Found) errors for API endpoints
+## Problem Identified
 
-## Root Causes
-1. **Frontend API URL**: The frontend `.env` file was pointing to `http://localhost:8000` instead of the Render backend URL
-2. **CORS Configuration**: The backend CORS settings needed to explicitly allow the Vercel frontend origin
+The frontend at `https://healthtrace-fe.vercel.app` is experiencing CORS errors when trying to access the backend API at `https://healthtrace-j1uc.onrender.com`.
 
-## Changes Made
+### Error Details
+```
+Access to fetch at 'https://healthtrace-j1uc.onrender.com/api/screenings/summary/' 
+from origin 'https://healthtrace-fe.vercel.app' has been blocked by CORS policy: 
+No 'Access-Control-Allow-Origin' header is present on the requested resource.
 
-### 1. Backend CORS Settings (`healthtrace_be/core/settings.py`)
-Updated the CORS configuration to be more explicit:
-- Set `CORS_ALLOW_ALL_ORIGINS = True` (explicitly)
-- Added `https://healthtrace-fe.vercel.app` to `CORS_ALLOWED_ORIGINS` list
-- Added explicit `CORS_ALLOW_METHODS` list (GET, POST, PUT, PATCH, DELETE, OPTIONS)
-- Added explicit `CORS_ALLOW_HEADERS` list for common headers
+GET https://healthtrace-j1uc.onrender.com/api/screenings/summary/ net::ERR_FAILED 404 (Not Found)
+```
 
-### 2. Backend Environment Variables (`healthtrace_be/.env`)
-Added `CORS_ALLOWED_ORIGINS` environment variable with the Vercel frontend URL
+## Root Cause
 
-### 3. Frontend API URL (`healthtrace-fe/.env`)
-Updated `VITE_API_URL` from `http://localhost:8000` to `https://healthtrace-j1uc.onrender.com`
+The **primary issue is NOT CORS** - it's that the backend is returning **404 (Not Found)** for all API endpoints. The CORS error is a secondary symptom because the browser blocks responses without CORS headers.
 
-## What You Need to Do
+**The backend at `https://healthtrace-j1uc.onrender.com` is not running or has crashed.**
 
-### Step 1: Set Vercel Environment Variable
-The frontend `.env` file is only used for local development. For the deployed Vercel app, you need to:
+## Solution
 
-1. Go to your Vercel dashboard
-2. Select the `healthtrace-fe` project
-3. Go to Settings → Environment Variables
-4. Add a new environment variable:
-   - **Name**: `VITE_API_URL`
-   - **Value**: `https://healthtrace-j1uc.onrender.com`
-   - **Environment**: Production (and Preview if needed)
-5. Redeploy the frontend on Vercel
+### Step 1: Check Render Dashboard
+1. Go to https://dashboard.render.com
+2. Find your `healthtrace-j1uc` service
+3. Check if it's running or if there are any deployment errors
 
-### Step 2: Redeploy Backend on Render
-The backend CORS changes need to be deployed:
+### Step 2: Redeploy the Backend
+If the service is not running, redeploy it by:
+1. Pushing any change to your GitHub repository (this triggers a new deployment)
+2. Or manually redeploy from the Render dashboard
 
-1. Commit the changes to your Git repository:
+The deployment will:
+- Install dependencies from `requirements.txt`
+- Run migrations from `build.sh`
+- Start the gunicorn server from `Procfile`
+
+### Step 3: Verify Environment Variables on Render
+Make sure these environment variables are set on Render:
+
+| Variable | Value | Description |
+|----------|-------|-------------|
+| `DJANGO_SECRET_KEY` | (generate a secure key) | Django secret key |
+| `DEBUG` | `False` | Set to False for production |
+| `ALLOWED_HOSTS` | `healthtrace-j1uc.onrender.com` | Allowed hosts |
+| `CORS_ALLOW_ALL_ORIGINS` | `True` | Allow all origins |
+| `CORS_ALLOWED_ORIGINS` | `https://healthtrace-fe.vercel.app` | Frontend URL |
+
+### Step 4: Check Database
+The backend uses SQLite which may not persist on Render's free tier. After deployment:
+1. Check if the database is populated with data
+2. Run the `populate_data` management command if needed:
    ```bash
-   git add healthtrace_be/core/settings.py
-   git add healthtrace_be/.env
-   git add healthtrace-fe/.env
-   git commit -m "Fix CORS configuration for Vercel frontend"
-   git push
+   python manage.py populate_data
    ```
 
-2. If Render is connected to your Git repository, it will auto-deploy
-3. Otherwise, manually trigger a deployment in the Render dashboard
+## Verification
 
-### Step 3: Verify the Fix
-After both deployments are complete:
+After redeploying, test the API endpoints:
 
-1. Open the frontend at `https://healthtrace-fe.vercel.app`
-2. Check the browser console for CORS errors
-3. Verify that API calls are successful
+```bash
+# Test the screenings endpoint
+curl https://healthtrace-j1uc.onrender.com/api/screenings/
 
-## API Endpoints Available
-Once the fix is deployed, these endpoints will be accessible:
+# Test the summary endpoint
+curl https://healthtrace-j1uc.onrender.com/api/screenings/summary/
 
-- `GET /api/screenings/` - List all screenings
-- `POST /api/screenings/` - Create new screening
-- `GET /api/screenings/{id}/` - Get specific screening
-- `PUT /api/screenings/{id}/` - Update screening
-- `DELETE /api/screenings/{id}/` - Delete screening
-- `GET /api/screenings/summary/` - Get statistics
-- `GET /api/screenings/notifications/` - Get notifications
-- `GET /api/screenings/analytics/` - Get analytics
-- `POST /api/screenings/{id}/consult/` - Doctor consultation
+# Test the analytics endpoint
+curl https://healthtrace-j1uc.onrender.com/api/screenings/analytics/
 
-## Troubleshooting
+# Test the notifications endpoint
+curl https://healthtrace-j1uc.onrender.com/api/screenings/notifications/
+```
 
-If CORS errors persist after deployment:
+All endpoints should return 200 OK with JSON data, not 404.
 
-1. **Check Render logs** for any deployment errors
-2. **Verify environment variables** are set correctly on Render:
-   - `DJANGO_SECRET_KEY`
-   - `DEBUG=False` (for production)
-   - `ALLOWED_HOSTS=healthtrace-j1uc.onrender.com,healthtrace-fe.vercel.app`
-   - `CORS_ALLOW_ALL_ORIGINS=True`
+## CORS Configuration (Already Correct)
 
-3. **Test the API directly**:
-   ```bash
-   curl https://healthtrace-j1uc.onrender.com/api/screenings/
-   ```
+The CORS configuration in [`healthtrace_be/core/settings.py`](healthtrace_be/core/settings.py) is already correctly configured:
 
-4. **Check Vercel environment variables**:
-   - Ensure `VITE_API_URL` is set to `https://healthtrace-j1uc.onrender.com`
-   - Redeploy after setting the variable
+```python
+CORS_ALLOW_ALL_ORIGINS = True
+CORS_ALLOWED_ORIGINS = [
+    'http://localhost:3000',
+    'http://localhost:5173',
+    'http://localhost:8080',
+    'https://healthtrace-j1uc.onrender.com',
+    'https://healthtrace-fe.vercel.app',
+]
+CORS_ALLOW_CREDENTIALS = True
+```
 
-## Additional Notes
+The `django-cors-headers` package is installed and the middleware is properly configured.
 
-- The backend uses `django-cors-headers` package for CORS handling
-- The middleware is correctly ordered (CorsMiddleware before CommonMiddleware)
-- The `.env` file changes are for local development; production uses environment variables set in the hosting platform
+## Frontend Configuration (Already Correct)
+
+The frontend API configuration in [`healthtrace-fe/src/api.js`](healthtrace-fe/src/api.js) is correctly configured:
+
+```javascript
+const API_BASE_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
+
+const api = axios.create({
+  baseURL: `${API_BASE_URL}/api`,
+  headers: {
+    "Content-Type": "application/json",
+  },
+  timeout: 10000,
+});
+```
+
+And the environment variable in [`healthtrace-fe/.env`](healthtrace-fe/.env) is set to:
+```
+VITE_API_URL=https://healthtrace-j1uc.onrender.com
+```
+
+## Summary
+
+**The fix is simple: Redeploy the backend on Render.** The CORS configuration is already correct, and the frontend is properly configured. The only issue is that the backend is not running.
+
+Once the backend is running and returning 200 OK responses instead of 404, the CORS errors will disappear automatically.
